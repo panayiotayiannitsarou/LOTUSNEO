@@ -670,10 +670,10 @@ def run_step4_multi_with_fill_v2(df: pd.DataFrame, config: Step4Config = Step4Co
     # Γράψε έως 5 σενάρια
     for k,sol in enumerate(sols, start=1):
         col = f"ΒΗΜΑ4_ΣΕΝΑΡΙΟ_{k}"
-        out[col] = np.nan
+        out[col] = pd.Series(index=out.index, dtype=object)  # object ώστε να δέχεται strings
         for idx, cl in sol["assign"].items():
             if pd.notna(cl):
-                out.loc[idx, col] = cl
+                out.loc[idx, col] = str(cl)
 
     # FILLED: μεταφορά όλων των υπαρχουσών αναθέσεων (βάση)
     for c in [c for c in out.columns if re.match(r"^ΒΗΜΑ4_ΣΕΝΑΡΙΟ_\d+$", str(c))]:
