@@ -21,6 +21,8 @@ import pandas as pd
 # Conflict helper — hard constraint ΣΥΓΚΡΟΥΣΗ (αμφίδρομος έλεγχος)
 # ---------------------------------------------------------------------------
 
+MAX_RUNS = 100  # default: 100 runs — ρυθμίζεται από το Streamlit (100/300/500)
+
 def _parse_conflicts_list(x: Any) -> List[str]:
     """Parsing ΣΥΓΚΡΟΥΣΗ — ίδια μορφή με ΦΙΛΟΙ."""
     return _parse_list_cell(x)  # forward ref OK (ορίζεται παρακάτω)
@@ -199,116 +201,169 @@ def calculate_penalty_score(df: pd.DataFrame, scenario_col: str,
 
     return penalty
 
-def step5_place_remaining_students(df: pd.DataFrame, scenario_col: str, 
-                                 num_classes: Optional[int] = None) -> Tuple[pd.DataFrame, int]:
+def step5_place_remaining_students(
+    df: pd.DataFrame,
+    scenario_col: str,
+    num_classes: Optional[int] = None,
+    seed: int = 42,
+    max_results: int = 5,
+    num_runs: int = MAX_RUNS,
+) -> Tuple[pd.DataFrame, int]:
     """
     Βήμα 5: Τοποθέτηση υπολοίπων μαθητών χωρίς (πλήρως αμοιβαίες) φιλίες.
-    
+
+    Τρέχει max_results φορές με διαφορετική σειρά μαθητών (randomized),
+    κρατά το σενάριο με το χαμηλότερο penalty score.
+
     Κριτήρια τοποθέτησης (με σειρά προτεραιότητας):
     1. Τμήμα με μικρότερο πληθυσμό (< 25 μαθητές)
     2. Σε ισοπαλία: προτίμηση όσων κρατούν διαφορά πληθυσμού ≤2
     3. Σε ισοπαλία: καλύτερη ισορροπία φύλου σε ΌΛΑ τα τμήματα
     """
-    df = df.copy()
-    labs = _get_class_labels(df, scenario_col)
-    if num_classes is None:
-        num_classes = _auto_num_classes(df, None)
+    rng = random.Random(seed)
 
-    # Προετοιμασία δεδομένων
-    friends_list = (df["ΦΙΛΟΙ"].map(_parse_list_cell) if "ΦΙΛΟΙ" in df.columns 
-                   else pd.Series([[]]*len(df)))
-    fully_mutual = (df["ΠΛΗΡΩΣ_ΑΜΟΙΒΑΙΑ"].apply(_is_yes) if "ΠΛΗΡΩΣ_ΑΜΟΙΒΑΙΑ" in df.columns 
-                   else pd.Series([False]*len(df)))
-    broken_friendship = (df["ΣΠΑΣΜΕΝΗ_ΦΙΛΙΑ"].apply(_is_yes) if "ΣΠΑΣΜΕΝΗ_ΦΙΛΙΑ" in df.columns 
-                        else pd.Series([False]*len(df)))
+    def _single_run(df_in: pd.DataFrame, order_seed: int) -> Tuple[pd.DataFrame, int]:
+        df_run = df_in.copy()
+        labs = _get_class_labels(df_run, scenario_col)
+        nc = num_classes if num_classes is not None else _auto_num_classes(df_run, None)
 
-    # Mask για μαθητές που χρειάζονται τοποθέτηση στο Βήμα 5
-    mask_step5 = (
-        df[scenario_col].isna() & 
-        ((friends_list.map(len) == 0) |  # Χωρίς φίλους
-         (~fully_mutual) |               # Όχι πλήρως αμοιβαίες φιλίες  
-         (broken_friendship))            # Σπασμένες φιλίες
-    )
+        friends_list = (df_run["ΦΙΛΟΙ"].map(_parse_list_cell) if "ΦΙΛΟΙ" in df_run.columns
+                        else pd.Series([[]] * len(df_run)))
+        fully_mutual = (df_run["ΠΛΗΡΩΣ_ΑΜΟΙΒΑΙΑ"].apply(_is_yes) if "ΠΛΗΡΩΣ_ΑΜΟΙΒΑΙΑ" in df_run.columns
+                        else pd.Series([False] * len(df_run)))
+        broken_friendship = (df_run["ΣΠΑΣΜΕΝΗ_ΦΙΛΙΑ"].apply(_is_yes) if "ΣΠΑΣΜΕΝΗ_ΦΙΛΙΑ" in df_run.columns
+                             else pd.Series([False] * len(df_run)))
 
-    remaining_students = df[mask_step5].copy()
+        mask_step5 = (
+            df_run[scenario_col].isna() &
+            ((friends_list.map(len) == 0) |
+             (~fully_mutual) |
+             (broken_friendship))
+        )
 
-    # Διαδοχική τοποθέτηση κάθε μαθητή
-    for _, row in remaining_students.iterrows():
-        name = str(row["ΟΝΟΜΑ"]).strip()
-        gender = str(row["ΦΥΛΟ"]).strip().upper()
+        remaining = df_run[mask_step5].copy()
+        # Τυχαία σειρά για αυτό το run
+        remaining = remaining.sample(frac=1, random_state=order_seed)
 
-        # 1. Εύρεση διαθέσιμων τμημάτων με ελάχιστο πληθυσμό
-        class_sizes = {lab: int((df[scenario_col] == lab).sum()) for lab in labs}
-        min_size = min(class_sizes.values())
-        available_classes = [lab for lab, size in class_sizes.items() 
-                           if size == min_size and size < 25]
-        
-        if not available_classes:
-            continue  # Όλα τα τμήματα γεμάτα
+        for _, row in remaining.iterrows():
+            name = str(row["ΟΝΟΜΑ"]).strip()
+            gender = str(row["ΦΥΛΟ"]).strip().upper()
 
-        if len(available_classes) == 1:
-            chosen_class = available_classes[0]
-        else:
-            # 2. Προτίμηση υποψηφίων που κρατούν διαφορά πληθυσμού ≤2
-            candidates_with_pop_diff = []
-            for candidate in available_classes:
-                new_sizes = {lab: int((df[scenario_col] == lab).sum()) + (1 if lab == candidate else 0)
-                           for lab in labs}
-                pop_diff = max(new_sizes.values()) - min(new_sizes.values())
-                candidates_with_pop_diff.append((candidate, pop_diff))
-            
-            # Φιλτράρισμα: προτίμηση όσων κρατούν pop_diff ≤ 2
-            preferred_pool = [c for c, d in candidates_with_pop_diff if d <= 2]
-            pool = preferred_pool if preferred_pool else [c for c, _ in candidates_with_pop_diff]
-            
-            if len(pool) == 1:
-                chosen_class = pool[0]
+            class_sizes = {lab: int((df_run[scenario_col] == lab).sum()) for lab in labs}
+            min_size = min(class_sizes.values())
+            available_classes = [lab for lab, size in class_sizes.items()
+                                  if size == min_size and size < 25]
+
+            if not available_classes:
+                continue
+
+            if len(available_classes) == 1:
+                chosen_class = available_classes[0]
             else:
-                # 3. Ισορροπία φύλου - υπολογισμός για ΌΛΑ τα τμήματα
-                best_score = float('inf')
-                best_classes = []
-                
-                for candidate in pool:
-                    # Προσομοίωση προσθήκης μαθητή στο candidate τμήμα
-                    boys_counts = []
-                    girls_counts = []
-                    
-                    for lab in labs:
-                        boys_in_class = int(((df[scenario_col] == lab) & 
-                                           (df["ΦΥΛΟ"].astype(str).str.upper() == "Α")).sum())
-                        girls_in_class = int(((df[scenario_col] == lab) & 
-                                            (df["ΦΥΛΟ"].astype(str).str.upper() == "Κ")).sum())
-                        
-                        # Προσθήκη μαθητή στο candidate
-                        if lab == candidate:
-                            if gender == "Α":
-                                boys_in_class += 1
-                            elif gender == "Κ":
-                                girls_in_class += 1
-                        
-                        boys_counts.append(boys_in_class)
-                        girls_counts.append(girls_in_class)
-                    
-                    # Υπολογισμός διαφοράς φύλου
-                    boys_diff = max(boys_counts) - min(boys_counts) if boys_counts else 0
-                    girls_diff = max(girls_counts) - min(girls_counts) if girls_counts else 0
-                    total_gender_diff = boys_diff + girls_diff
-                    
-                    if total_gender_diff < best_score:
-                        best_score = total_gender_diff
-                        best_classes = [candidate]
-                    elif total_gender_diff == best_score:
-                        best_classes.append(candidate)
-                
-                # Τυχαία επιλογή σε ισοπαλία
-                chosen_class = random.choice(best_classes)
+                candidates_with_pop_diff = []
+                for candidate in available_classes:
+                    new_sizes = {lab: int((df_run[scenario_col] == lab).sum()) + (1 if lab == candidate else 0)
+                                 for lab in labs}
+                    pop_diff = max(new_sizes.values()) - min(new_sizes.values())
+                    candidates_with_pop_diff.append((candidate, pop_diff))
 
-        # Τοποθέτηση μαθητή — μόνο αν δεν υπάρχει δηλωμένη σύγκρουση
-        if not _has_conflict_in_class(df, name, chosen_class, scenario_col):
-            df.loc[df["ΟΝΟΜΑ"] == name, scenario_col] = chosen_class
-        # Αν υπάρχει σύγκρουση, ο μαθητής παραμένει ατοποθέτητος για επόμενο βήμα
+                preferred_pool = [c for c, d in candidates_with_pop_diff if d <= 2]
+                pool = preferred_pool if preferred_pool else [c for c, _ in candidates_with_pop_diff]
 
-    return df, calculate_penalty_score(df, scenario_col, num_classes)
+                if len(pool) == 1:
+                    chosen_class = pool[0]
+                else:
+                    best_score = float('inf')
+                    best_classes = []
+                    for candidate in pool:
+                        boys_counts = []
+                        girls_counts = []
+                        for lab in labs:
+                            b = int(((df_run[scenario_col] == lab) &
+                                     (df_run["ΦΥΛΟ"].astype(str).str.upper() == "Α")).sum())
+                            g = int(((df_run[scenario_col] == lab) &
+                                     (df_run["ΦΥΛΟ"].astype(str).str.upper() == "Κ")).sum())
+                            if lab == candidate:
+                                if gender == "Α": b += 1
+                                elif gender == "Κ": g += 1
+                            boys_counts.append(b)
+                            girls_counts.append(g)
+                        total_gender_diff = (max(boys_counts) - min(boys_counts) +
+                                             max(girls_counts) - min(girls_counts))
+                        if total_gender_diff < best_score:
+                            best_score = total_gender_diff
+                            best_classes = [candidate]
+                        elif total_gender_diff == best_score:
+                            best_classes.append(candidate)
+                    chosen_class = rng.choice(best_classes)
+
+            if not _has_conflict_in_class(df_run, name, chosen_class, scenario_col):
+                df_run.loc[df_run["ΟΝΟΜΑ"] == name, scenario_col] = chosen_class
+
+        return df_run, calculate_penalty_score(df_run, scenario_col, nc)
+
+    # --- Multi-run: έως num_runs τυχαίες σειρές, κρατάμε max_results καλύτερα ---
+    best_df, best_penalty = _single_run(df, seed)
+    seen_penalties = {best_penalty}
+    candidates: List[Tuple[int, pd.DataFrame]] = [(best_penalty, best_df)]
+
+    for i in range(1, num_runs):
+        run_df, run_penalty = _single_run(df, seed + i)
+        entry = (run_penalty, run_df)
+        candidates.append(entry)
+        if run_penalty < best_penalty:
+            best_penalty = run_penalty
+            best_df = run_df
+
+    # Ταξινόμηση — κρατάμε έως max_results μοναδικά (βάσει penalty)
+    candidates.sort(key=lambda x: x[0])
+    # deduplicate by penalty value (κρατάμε πρώτο ανά penalty)
+    seen: set = set()
+    unique_candidates: List[Tuple[int, pd.DataFrame]] = []
+    for pen, cdf in candidates:
+        if pen not in seen:
+            seen.add(pen)
+            unique_candidates.append((pen, cdf))
+        if len(unique_candidates) >= max_results:
+            break
+
+    # Επιστροφή του καλύτερου (backward-compat: Tuple[df, penalty])
+    best_penalty, best_df = unique_candidates[0]
+    return best_df, best_penalty
+
+
+def step5_generate_scenarios(
+    df: pd.DataFrame,
+    scenario_col: str,
+    num_classes: Optional[int] = None,
+    seed: int = 42,
+    max_results: int = 5,
+    num_runs: int = MAX_RUNS,
+) -> List[Tuple[str, pd.DataFrame, int]]:
+    """
+    Νέα συνάρτηση: επιστρέφει έως max_results σενάρια ως List[(label, df, penalty)].
+    Τρέχει num_runs φορές με τυχαία σειρά μαθητών.
+    """
+    rng = random.Random(seed)
+
+    def _single_run(order_seed: int) -> Tuple[pd.DataFrame, int]:
+        return step5_place_remaining_students(df, scenario_col, num_classes,
+                                              seed=order_seed, max_results=1,
+                                              num_runs=1)
+
+    seen: set = set()
+    results: List[Tuple[str, pd.DataFrame, int]] = []
+
+    for i in range(num_runs):
+        run_df, run_penalty = _single_run(seed + i)
+        if run_penalty not in seen:
+            seen.add(run_penalty)
+            results.append((f"ΒΗΜΑ5_ΣΕΝΑΡΙΟ_{len(results)+1}", run_df, run_penalty))
+        if len(results) >= max_results:
+            break
+
+    results.sort(key=lambda x: x[2])
+    return results
 
 def apply_step5_to_all_scenarios(scenarios_dict: Dict[str, pd.DataFrame], 
                                scenario_col: str, num_classes: Optional[int] = None) -> Tuple[pd.DataFrame, int, str]:

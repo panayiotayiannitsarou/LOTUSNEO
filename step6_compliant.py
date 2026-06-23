@@ -110,7 +110,7 @@ TARGET_POP_DIFF = 2
 TARGET_GENDER_DIFF = 3
 TARGET_LANG_DIFF = 3
 
-MAX_ITER = 5
+MAX_ITER = 100  # default: 100 ανταλλαγές — ρυθμίζεται από το Streamlit (100/300/500)
 
 # Αποδεκτές τιμές για στήλη ΒΗΜΑ_ΤΟΠΟΘΕΤΗΣΗΣ
 STEP4_MARKERS = {4, "4", "Βήμα 4", "Step4", "Step4_Group", "Β4", "Β4_Δυάδα"}
@@ -732,6 +732,61 @@ def _commit_best_swap_if_improves(df: pd.DataFrame, df_baseline: pd.DataFrame,
 # --------------------------
 # Public API
 # --------------------------
+def pick_best_step6(step6_results: Dict[str, Dict]) -> Tuple[str, pd.DataFrame, Dict]:
+    """
+    Επιλέγει το καλύτερο σενάριο από τα αποτελέσματα του Βήματος 6.
+    Κριτήριο: χαμηλότερο penalty (αν υπάρχει στο summary), αλλιώς πρώτο non-ERROR.
+    """
+    best_name, best_result = None, None
+    best_penalty = float("inf")
+    for name, result in step6_results.items():
+        if result.get("summary", {}).get("status") == "ERROR":
+            continue
+        pen = result.get("summary", {}).get("final_penalty", float("inf"))
+        if pen < best_penalty:
+            best_penalty = pen
+            best_name = name
+            best_result = result
+    if best_result is None:
+        # Fallback: πρώτο διαθέσιμο
+        best_name, best_result = next(iter(step6_results.items()))
+    return best_name, best_result["df"], best_result.get("summary", {})
+
+
+def step6_generate_scenarios(
+    step5_scenarios: List[Tuple[str, pd.DataFrame, int]],
+    *,
+    class_col: str = "ΤΜΗΜΑ",
+    id_col: str = "ID",
+    gender_col: str = "ΦΥΛΟ",
+    lang_col: str = "ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ",
+    step_col: str = "ΒΗΜΑ_ΤΟΠΟΘΕΤΗΣΗΣ",
+    group_col: str = "GROUP_ID",
+    max_iter: int = MAX_ITER,
+    max_results: int = 5,
+) -> List[Tuple[str, pd.DataFrame, Dict]]:
+    """
+    Εφαρμόζει Βήμα 6 σε έως max_results σενάρια από το Βήμα 5.
+    Επιστρέφει List[(label, df, summary)] ταξινομημένα βάσει final_penalty.
+    """
+    results: List[Tuple[str, pd.DataFrame, Dict]] = []
+    for label, df5, _pen5 in step5_scenarios[:max_results]:
+        try:
+            result = apply_step6(
+                df5.copy(),
+                class_col=class_col, id_col=id_col,
+                gender_col=gender_col, lang_col=lang_col,
+                step_col=step_col, group_col=group_col,
+                max_iter=max_iter,
+            )
+            results.append((label, result["df"], result.get("summary", {})))
+        except Exception as e:
+            print(f"Βήμα 6 σφάλμα για {label}: {e}")
+
+    results.sort(key=lambda x: x[2].get("final_penalty", float("inf")))
+    return results
+
+
 def apply_step6_to_step5_scenarios(step5_outputs: Dict[str, pd.DataFrame],
                                    *, class_col: str = "ΤΜΗΜΑ", id_col: str = "ID", 
                                    gender_col: str = "ΦΥΛΟ", lang_col: str = "ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ", 
@@ -1104,7 +1159,7 @@ def export_single_noaudit(in14_path: str, out_path: str):
                 class_col=s5, id_col="Α/Α",
                 gender_col="ΦΥΛΟ", lang_col="ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ",
                 step_col="ΒΗΜΑ_ΤΟΠΟΘΕΤΗΣΗΣ", group_col="GROUP_ID",
-                max_iter=5
+                max_iter=MAX_ITER
             )
             df6 = out6["df"].copy()
 
