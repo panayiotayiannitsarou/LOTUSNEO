@@ -24,7 +24,6 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple, Optional, FrozenSet
 import pandas as pd
 import numpy as np
-import itertools
 import math
 import re
 import ast
@@ -354,7 +353,7 @@ class Step1ImmutableProcessor:
             print(f"Εφαρμογή Κανόνα 2 (εξαντλητική με φιλίες)")
             valid_assignments = self._exhaustive_generation(teacher_kids, num_classes, friendships)
             
-            for i, (assignments_dict, broken_count) in enumerate(valid_assignments[:5], 1):
+            for i, (assignments_dict, broken_count) in enumerate(valid_assignments[:10], 1):
                 scenario = Step1Scenario(
                     id=i,
                     column_name=f"ΒΗΜΑ1_ΣΕΝΑΡΙΟ_{i}",
@@ -368,67 +367,71 @@ class Step1ImmutableProcessor:
     
     def _exhaustive_generation(self, teacher_kids: List[str], num_classes: int, 
                              friendships: FrozenSet[Tuple[str, str]]) -> List[Tuple[Dict[str, str], int]]:
-        """Εξαντλητική παραγωγή σεναρίων"""
+        """
+        Backtracking με pruning αντί για itertools.product.
+        Αποφεύγει εκθετική έκρηξη για μεγάλο αριθμό παιδιών εκπαιδευτικών.
+        TOP_K = 10 — κρατά τα 10 καλύτερα σενάρια.
+        """
+        TOP_K = 10
         class_labels_list = [f"Α{i+1}" for i in range(num_classes)]
-        valid_scenarios = []
-        seen_canonical = set()
-        
-        print(f"Παραγωγή σεναρίων για {len(teacher_kids)} παιδιά σε {num_classes} τμήματα...")
-        
-        # Εξαντλητική παραγωγή
-        total_combinations = num_classes ** len(teacher_kids)
-        print(f"Συνολικές περιπτώσεις: {total_combinations:,}")
-        
-        for assignment in itertools.product(class_labels_list, repeat=len(teacher_kids)):
-            assign_map = {teacher_kids[i]: assignment[i] for i in range(len(teacher_kids))}
-            
-            # ΕΛΕΓΧΟΣ 1: Ισοκατανομή ≤1
-            class_counts = {c: 0 for c in class_labels_list}
-            for name in teacher_kids:
-                class_counts[assign_map[name]] += 1
-            
-            counts_list = list(class_counts.values())
-            if max(counts_list) - min(counts_list) > 1:
-                continue  # Απόρριψη ανισοκατανομής >1
-            
-            # ΕΛΕΓΧΟΣ 2: Όχι όλα στο ίδιο τμήμα
-            unique_classes = set(assign_map.values())
-            if len(unique_classes) == 1:
-                continue  # Απόρριψη
-            
-            # ΕΛΕΓΧΟΣ 3: Canonical uniqueness
-            canon_key = self._canonical_key(teacher_kids, assign_map, class_labels_list)
-            if canon_key in seen_canonical:
-                continue
-            seen_canonical.add(canon_key)
-            
-            # Υπολογισμός σπασμένων φιλιών
-            broken_friendships = self._count_broken_friendships(teacher_kids, assign_map, friendships)
-            
-            valid_scenarios.append((assign_map, broken_friendships))
-        
+        valid_scenarios: List[Tuple[Dict[str, str], int]] = []
+        seen_canonical: set = set()
+
+        print(f"Backtracking για {len(teacher_kids)} παιδιά σε {num_classes} τμήματα...")
+
+        assign_map: Dict[str, str] = {}
+        counts: Dict[str, int] = {c: 0 for c in class_labels_list}
+        max_per_class = math.ceil(len(teacher_kids) / num_classes)
+
+        def backtrack(i: int) -> None:
+            if i == len(teacher_kids):
+                # Έλεγχος: όχι όλα στο ίδιο τμήμα
+                if len(set(assign_map.values())) == 1:
+                    return
+                # Canonical uniqueness
+                canon_key = self._canonical_key(teacher_kids, assign_map, class_labels_list)
+                if canon_key in seen_canonical:
+                    return
+                seen_canonical.add(canon_key)
+
+                broken = self._count_broken_friendships(teacher_kids, assign_map, friendships)
+                valid_scenarios.append((assign_map.copy(), broken))
+
+                # TOP_K pruning
+                if len(valid_scenarios) > TOP_K * 3:
+                    valid_scenarios.sort(key=lambda x: x[1])
+                    del valid_scenarios[TOP_K * 3:]
+                return
+
+            name = teacher_kids[i]
+            for cl in class_labels_list:
+                # Pruning: αν το τμήμα είναι ήδη γεμάτο
+                if counts[cl] >= max_per_class:
+                    continue
+                # Pruning: ισοκατανομή ≤1
+                remaining = len(teacher_kids) - i - 1
+                current_max = max(counts.values())
+                current_min = min(counts.values())
+                if counts[cl] > 0 and current_max - current_min > 1:
+                    continue
+
+                assign_map[name] = cl
+                counts[cl] += 1
+                backtrack(i + 1)
+                del assign_map[name]
+                counts[cl] -= 1
+
+        backtrack(0)
+
         print(f"Έγκυρα σενάρια: {len(valid_scenarios)}")
-        
-        # Φιλτράρισμα αν >5
-        if len(valid_scenarios) > 5:
-            print("Εφαρμογή φιλτραρίσματος...")
-            
-            # Προτεραιότητα σε σενάρια με λιγότερα σπασμένα φιλιά
-            min_broken = min(s[1] for s in valid_scenarios)
-            if min_broken == 0:
-                scenarios_without_breaks = [s for s in valid_scenarios if s[1] == 0]
-                print(f"Βρέθηκαν {len(scenarios_without_breaks)} σενάρια χωρίς σπασμένες φιλίες")
-                valid_scenarios = scenarios_without_breaks
-            else:
-                print(f"Όλα σπάζουν φιλίες (min: {min_broken}) - ταξινόμηση")
-                valid_scenarios.sort(key=lambda x: x[1])
-            
-            # Τελική επιλογή 5 σεναρίων
-            if len(valid_scenarios) > 5:
-                valid_scenarios = valid_scenarios[:5]
-        
-        print(f"Τελική επιλογή: {len(valid_scenarios)} σενάρια")
-        return valid_scenarios
+
+        # Ταξινόμηση: λιγότερα broken πρώτα
+        valid_scenarios.sort(key=lambda x: x[1])
+
+        # Κράτα τα TOP_K καλύτερα
+        result = valid_scenarios[:TOP_K]
+        print(f"Τελική επιλογή: {len(result)} σενάρια")
+        return result
 
 
 # === UTILITY FUNCTIONS ===
